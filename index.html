@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#111111" />
+  <title>Moodboard Lab</title>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="toast" class="toast" aria-live="polite"></div>
+
+  <header class="topbar">
+    <div class="brand" data-action="home">
+      <span class="brand-mark">M</span>
+      <div><strong>Moodboard Lab</strong><small>progetta · pesa · componi</small></div>
+    </div>
+    <div class="top-actions">
+      <span id="saveStatus" class="save-status"></span>
+      <button id="homeBtn" class="ghost hidden" data-action="home">Home</button>
+      <button id="logoutBtn" class="ghost hidden" data-action="logout">Esci</button>
+    </div>
+  </header>
+
+  <main id="app"></main>
+
+  <template id="loadingTemplate">
+    <section class="center-screen"><div class="spinner"></div><p>Caricamento…</p></section>
+  </template>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
