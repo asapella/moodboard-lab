@@ -1,4 +1,4 @@
-/* Moodboard Lab V1 — plain JS + Supabase */
+/* Moodboard Lab V3 — category-aware layout, elastic reflow, title tools, real palette */
 const cfg = window.MOODBOARD_CONFIG || {};
 const configured = cfg.SUPABASE_URL && !cfg.SUPABASE_URL.includes('YOUR_PROJECT') && cfg.SUPABASE_PUBLISHABLE_KEY && !cfg.SUPABASE_PUBLISHABLE_KEY.includes('YOUR_KEY');
 const supabaseClient = configured ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_PUBLISHABLE_KEY, { auth:{ persistSession:true, autoRefreshToken:true, detectSessionInUrl:true }}) : null;
@@ -6,9 +6,12 @@ const supabaseClient = configured ? window.supabase.createClient(cfg.SUPABASE_UR
 const $ = (s, r=document) => r.querySelector(s);
 const $$ = (s, r=document) => [...r.querySelectorAll(s)];
 const app = $('#app');
-const state = { session:null, profile:null, route:'home', project:null, moodboard:null, items:[], selectedItem:null, teacherViewing:false, saveTimer:null, urls:new Map(), classId:null };
+const state = { session:null, profile:null, route:'home', project:null, moodboard:null, items:[], selectedItem:null, teacherViewing:false, urls:new Map(), classId:null, itemSaveTimer:null, moodboardSaveTimer:null, pendingItemIds:new Set(), pendingMoodboardPatch:{} };
 const CATEGORIES = ['Forma','Materiale','Colore','Atmosfera','Texture','Riferimento','Altro'];
 const LAYOUTS = ['editoriale','griglia','collage','architettura'];
+const CATEGORY_GROUP = {Forma:'struttura',Riferimento:'struttura',Materiale:'materia',Texture:'materia',Colore:'atmosfera',Atmosfera:'atmosfera',Altro:'altro'};
+const CATEGORY_ORDER = ['Forma','Riferimento','Materiale','Texture','Colore','Atmosfera','Altro'];
+const TITLE_FONTS = ['Arial','Georgia','Times New Roman','Verdana','Trebuchet MS','Courier New','system-ui'];
 
 function esc(v=''){return String(v).replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));}
 function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200)}
@@ -37,6 +40,8 @@ window.addEventListener('click', async e=>{
   if(a==='submit') return toggleSubmit();
   if(a==='delete-item') return deleteSelectedItem();
   if(a==='export') return exportBoard();
+  if(a==='extract-palette') return extractPalette();
+  if(a==='palette-bg') return usePaletteColor(el.dataset.color);
   if(a==='close-modal') return closeModal();
 });
 
@@ -124,47 +129,232 @@ async function createClass(e){e.preventDefault();const f=new FormData(e.target);
 async function renderTeacherStudent(studentId,classId){setLoading();const {data:profile}=await supabaseClient.from('profiles').select('*').eq('id',studentId).single();const {data:projects,error}=await supabaseClient.from('projects').select('*, moodboards(id,status,thumbnail_path,updated_at)').eq('owner_id',studentId).eq('class_id',classId).order('updated_at',{ascending:false});if(error)return fatal(error);app.innerHTML=`<div class="page-head"><div><div class="eyebrow">Studente</div><h1>${esc(profile?.full_name||'Studente')}</h1><div class="muted">Vista docente · sola lettura</div></div></div><div class="grid" id="projectGrid"></div>`;const g=$('#projectGrid');if(!projects?.length)g.innerHTML='<div class="empty-state">Nessun progetto.</div>';for(const p of projects||[])g.append(await projectCard(p,true))}
 
 async function openMoodboard(id,readonly=false){
-  setLoading();const {data:m,error}=await supabaseClient.from('moodboards').select('*, projects(title,description,owner_id,class_id)').eq('id',id).single();if(error)return fatal(error);state.moodboard=m;state.teacherViewing=readonly||m.owner_id!==uid();
-  const r=await supabaseClient.from('moodboard_items').select('*').eq('moodboard_id',id).order('created_at');if(r.error)return fatal(r.error);state.items=r.data||[];await Promise.all(state.items.map(ensureItemUrl));renderEditor();
+  setLoading();
+  const {data:m,error}=await supabaseClient.from('moodboards').select('*, projects(title,description,owner_id,class_id)').eq('id',id).single();
+  if(error)return fatal(error);
+  state.moodboard=m;state.teacherViewing=readonly||m.owner_id!==uid();
+  const r=await supabaseClient.from('moodboard_items').select('*').eq('moodboard_id',id).order('created_at');
+  if(r.error)return fatal(r.error);
+  state.items=r.data||[];await Promise.all(state.items.map(ensureItemUrl));renderEditor();
 }
-function renderEditor(){const m=state.moodboard;app.innerHTML=`<div class="page-head"><div><div class="eyebrow">${state.teacherViewing?'Vista docente':'Editor moodboard'}</div><h1>${esc(m.title)}</h1><div class="muted">${esc(m.projects?.title||'')}</div></div><div class="row wrap">${state.teacherViewing?'':`<button class="ghost" data-action="submit">${m.status==='submitted'?'Riapri consegna':'Consegna al docente'}</button><button class="btn" data-action="export">Esporta PNG</button>`}</div></div><div class="editor-shell"><aside class="card editor-panel">${state.teacherViewing?'<div class="teacher-readonly">Sola lettura: non puoi modificare il lavoro dello studente.</div>':''}<div class="stack"><div><strong>Immagini</strong><p class="muted" style="font-size:12px">Peso 1–5 = importanza visiva.</p></div>${state.teacherViewing?'':`<div id="dropzone" class="dropzone"><strong>+ Aggiungi immagini</strong><div class="muted" style="font-size:11px;margin-top:4px">clic o trascina JPG/PNG/WebP</div><input id="fileInput" type="file" accept="image/*" multiple hidden></div>`}<div id="imageList" class="image-list"></div></div></aside><section class="card board-wrap"><div id="board" class="board"><div class="board-title">${esc(m.title)}</div></div></section><aside class="card editor-panel"><div class="stack"><div><strong>Composizione</strong></div><div class="layout-options">${LAYOUTS.map(x=>`<button class="layout-btn ${m.layout_type===x?'active':''}" data-action="layout" data-layout="${x}" ${state.teacherViewing?'disabled':''}>${x}</button>`).join('')}</div><label>Titolo<input id="mbTitle" class="input" value="${esc(m.title)}" ${state.teacherViewing?'disabled':''}></label><label>Sfondo<input id="bgColor" type="color" value="${esc(m.background_color||'#ffffff')}" ${state.teacherViewing?'disabled':''}></label><div><strong>Palette immagini</strong><div id="palette" class="palette" style="margin-top:7px"></div></div><div id="selectedControls"></div></div></aside></div>`;
-  renderImageList();renderBoard();renderPalette();
-  if(!state.teacherViewing){setupUploads();$('#mbTitle').addEventListener('change',async e=>{state.moodboard.title=e.target.value;await updateMoodboard({title:e.target.value})});$('#bgColor').addEventListener('input',e=>{$('#board').style.background=e.target.value;scheduleMoodboardSave({background_color:e.target.value})})}
+
+function renderEditor(){
+  const m=state.moodboard;
+  const disabled=state.teacherViewing?'disabled':'';
+  app.innerHTML=`<div class="page-head"><div><div class="eyebrow">${state.teacherViewing?'Vista docente':'Editor moodboard'}</div><h1>${esc(m.title)}</h1><div class="muted">${esc(m.projects?.title||'')}</div></div><div class="row wrap">${state.teacherViewing?'':`<button class="ghost" data-action="submit">${m.status==='submitted'?'Riapri consegna':'Consegna al docente'}</button><button class="btn" data-action="export">Esporta PNG</button>`}</div></div>
+  <div class="editor-shell">
+    <aside class="card editor-panel">${state.teacherViewing?'<div class="teacher-readonly">Sola lettura: non puoi modificare il lavoro dello studente.</div>':''}<div class="stack"><div><strong>Immagini</strong><p class="muted" style="font-size:12px"><strong>Peso</strong> = gerarchia/dimensione · <strong>Categoria</strong> = raggruppamento e zona della tavola.</p></div>${state.teacherViewing?'':`<div id="dropzone" class="dropzone"><strong>+ Aggiungi immagini</strong><div class="muted" style="font-size:11px;margin-top:4px">clic o trascina JPG/PNG/WebP</div><input id="fileInput" type="file" accept="image/*" multiple hidden></div>`}<div id="imageList" class="image-list"></div></div></aside>
+    <section class="card board-wrap"><div id="board" class="board"><div class="board-title ${state.teacherViewing?'readonly':''}">${esc(m.title)}</div></div></section>
+    <aside class="card editor-panel"><div class="stack">
+      <div><strong>Composizione</strong><p class="muted" style="font-size:11px;margin:5px 0 0">Forma/Riferimento, Materia/Texture e Colore/Atmosfera vengono trattati come famiglie visive.</p></div>
+      <div class="layout-options">${LAYOUTS.map(x=>`<button class="layout-btn ${m.layout_type===x?'active':''}" data-action="layout" data-layout="${x}" ${disabled}>${x}</button>`).join('')}</div>
+      <label class="checkline"><input id="autoReflow" type="checkbox" ${m.auto_reflow!==false?'checked':''} ${disabled}><span>Adatta le altre immagini quando sposto o ridimensiono</span></label>
+      <div class="panel-separator"></div>
+      <strong>Titolo</strong>
+      <label>Testo<input id="mbTitle" class="input" value="${esc(m.title)}" ${disabled}></label>
+      <div class="control-grid two"><label>Font<select id="titleFont" ${disabled}>${TITLE_FONTS.map(f=>`<option value="${esc(f)}" ${String(m.title_font||'Arial')===f?'selected':''}>${esc(f)}</option>`).join('')}</select></label><label>Colore<input id="titleColor" type="color" value="${esc(m.title_color||'#111111')}" ${disabled}></label></div>
+      <label>Dimensione <span id="titleSizeValue" class="value-badge">${Number(m.title_size||4).toFixed(1)}%</span><input id="titleSize" type="range" min="1.8" max="10" step="0.2" value="${m.title_size||4}" ${disabled}></label>
+      <label>Larghezza <span id="titleWidthValue" class="value-badge">${Math.round(m.title_width||60)}%</span><input id="titleWidth" type="range" min="15" max="96" step="1" value="${m.title_width||60}" ${disabled}></label>
+      <div class="control-grid two"><label>Posizione X<input id="titleX" type="range" min="0" max="90" step="1" value="${m.title_x??4}" ${disabled}></label><label>Posizione Y<input id="titleY" type="range" min="0" max="94" step="1" value="${m.title_y??84}" ${disabled}></label></div>
+      <div class="control-grid two"><label>Allineamento<select id="titleAlign" ${disabled}><option value="left" ${(m.title_align||'left')==='left'?'selected':''}>Sinistra</option><option value="center" ${m.title_align==='center'?'selected':''}>Centro</option><option value="right" ${m.title_align==='right'?'selected':''}>Destra</option></select></label><label>Peso font<select id="titleWeight" ${disabled}><option value="400" ${+m.title_weight===400?'selected':''}>Normale</option><option value="700" ${+m.title_weight===700?'selected':''}>Bold</option><option value="900" ${+m.title_weight!==400&&+m.title_weight!==700?'selected':''}>Black</option></select></label></div>
+      <div class="panel-separator"></div>
+      <label>Sfondo<input id="bgColor" type="color" value="${esc(m.background_color||'#ffffff')}" ${disabled}></label>
+      <div><div class="row"><strong class="grow">Palette immagini</strong>${state.teacherViewing?'':`<button class="ghost compact" data-action="extract-palette">Estrai palette</button>`}</div><p class="muted" style="font-size:11px;margin:5px 0 7px">Calcolata dalle foto e pesata anche in base alla loro importanza. Clicca un colore per usarlo come sfondo.</p><div id="palette" class="palette"></div></div>
+      <div id="selectedControls"></div>
+    </div></aside>
+  </div>`;
+  renderImageList();renderBoard();renderPalette();renderSelectedControls();
+  if(!state.teacherViewing){
+    setupUploads();setupTitleControls();setupTitleDrag();
+    $('#bgColor').addEventListener('input',e=>{state.moodboard.background_color=e.target.value;$('#board').style.background=e.target.value;scheduleMoodboardSave({background_color:e.target.value})});
+    $('#autoReflow').addEventListener('change',e=>{state.moodboard.auto_reflow=e.target.checked;scheduleMoodboardSave({auto_reflow:e.target.checked})});
+  }
 }
-function renderImageList(){const list=$('#imageList');list.innerHTML='';for(const it of state.items){const d=document.createElement('div');d.className='image-card';d.innerHTML=`<img src="${it._url||''}"><div><div class="row"><strong class="grow" style="font-size:12px">${esc(it.file_name||'immagine')}</strong><div class="weight-dots">${[1,2,3,4,5].map(n=>`<i class="${n<=it.weight?'on':''}"></i>`).join('')}</div></div>${state.teacherViewing?`<div class="muted" style="font-size:11px;margin-top:7px">${esc(it.category)} · peso ${it.weight}</div>`:`<div class="mini-controls"><select data-item-weight="${it.id}">${[1,2,3,4,5].map(n=>`<option value="${n}" ${n===it.weight?'selected':''}>Peso ${n}</option>`).join('')}</select><select data-item-cat="${it.id}">${CATEGORIES.map(c=>`<option ${c===it.category?'selected':''}>${c}</option>`).join('')}</select></div>`}</div>`;list.append(d)}
-  if(!state.teacherViewing){$$('[data-item-weight]').forEach(s=>s.addEventListener('change',e=>updateItemField(e.target.dataset.itemWeight,'weight',+e.target.value,true)));$$('[data-item-cat]').forEach(s=>s.addEventListener('change',e=>updateItemField(e.target.dataset.itemCat,'category',e.target.value,false)))}
+
+function setupTitleControls(){
+  const binds=[
+    ['mbTitle','title',v=>v],['titleFont','title_font',v=>v],['titleColor','title_color',v=>v],
+    ['titleSize','title_size',Number],['titleWidth','title_width',Number],['titleX','title_x',Number],['titleY','title_y',Number],
+    ['titleAlign','title_align',v=>v],['titleWeight','title_weight',Number]
+  ];
+  for(const [id,field,parse] of binds){
+    const el=$('#'+id);if(!el)continue;
+    const event=(el.tagName==='SELECT')?'change':'input';
+    el.addEventListener(event,e=>{
+      const v=parse(e.target.value);state.moodboard[field]=v;
+      if(field==='title'){$('.page-head h1').textContent=v||'Moodboard';}
+      if(field==='title_size')$('#titleSizeValue').textContent=Number(v).toFixed(1)+'%';
+      if(field==='title_width')$('#titleWidthValue').textContent=Math.round(v)+'%';
+      applyTitleStyle();scheduleMoodboardSave({[field]:v});
+    });
+  }
+}
+
+function applyTitleStyle(){
+  const t=$('.board-title');if(!t)return;const m=state.moodboard;
+  t.textContent=m.title||'';t.style.left=`${m.title_x??4}%`;t.style.top=`${m.title_y??84}%`;t.style.width=`${m.title_width||60}%`;
+  t.style.color=m.title_color||'#111111';t.style.fontFamily=fontCss(m.title_font||'Arial');t.style.fontSize=`${m.title_size||4}cqw`;
+  t.style.fontWeight=String(m.title_weight||900);t.style.textAlign=m.title_align||'left';
+}
+function fontCss(v){return v==='system-ui'?'system-ui, sans-serif':`"${String(v).replace(/"/g,'')}", sans-serif`}
+
+function setupTitleDrag(){
+  const el=$('.board-title');if(!el||state.teacherViewing)return;let start=null;
+  el.addEventListener('pointerdown',e=>{e.stopPropagation();el.setPointerCapture(e.pointerId);start={px:e.clientX,py:e.clientY,x:+(state.moodboard.title_x??4),y:+(state.moodboard.title_y??84)};el.classList.add('dragging')});
+  el.addEventListener('pointermove',e=>{if(!start)return;const r=$('#board').getBoundingClientRect();state.moodboard.title_x=clamp(start.x+(e.clientX-start.px)/r.width*100,0,95);state.moodboard.title_y=clamp(start.y+(e.clientY-start.py)/r.height*100,0,95);el.style.left=state.moodboard.title_x+'%';el.style.top=state.moodboard.title_y+'%';if($('#titleX'))$('#titleX').value=state.moodboard.title_x;if($('#titleY'))$('#titleY').value=state.moodboard.title_y});
+  el.addEventListener('pointerup',()=>{if(!start)return;start=null;el.classList.remove('dragging');scheduleMoodboardSave({title_x:state.moodboard.title_x,title_y:state.moodboard.title_y})});
+}
+
+function renderImageList(){
+  const list=$('#imageList');list.innerHTML='';
+  for(const it of state.items){
+    const d=document.createElement('div');d.className='image-card';
+    d.innerHTML=`<img src="${it._url||''}"><div><div class="row"><strong class="grow" style="font-size:12px">${esc(it.file_name||'immagine')}</strong><div class="weight-dots">${[1,2,3,4,5].map(n=>`<i class="${n<=it.weight?'on':''}"></i>`).join('')}</div></div>${state.teacherViewing?`<div class="muted" style="font-size:11px;margin-top:7px">${esc(it.category)} · peso ${it.weight}</div>`:`<div class="mini-controls"><select data-item-weight="${it.id}">${[1,2,3,4,5].map(n=>`<option value="${n}" ${n===it.weight?'selected':''}>Peso ${n}</option>`).join('')}</select><select data-item-cat="${it.id}">${CATEGORIES.map(c=>`<option ${c===it.category?'selected':''}>${c}</option>`).join('')}</select></div>`}</div>`;list.append(d);
+  }
+  if(!state.teacherViewing){
+    $$('[data-item-weight]').forEach(s=>s.addEventListener('change',e=>updateItemField(e.target.dataset.itemWeight,'weight',+e.target.value,true)));
+    $$('[data-item-cat]').forEach(s=>s.addEventListener('change',e=>updateItemField(e.target.dataset.itemCat,'category',e.target.value,true)));
+  }
 }
 async function setupUploads(){const dz=$('#dropzone'),inp=$('#fileInput');dz.addEventListener('click',()=>inp.click());inp.addEventListener('change',()=>uploadFiles(inp.files));['dragenter','dragover'].forEach(x=>dz.addEventListener(x,e=>{e.preventDefault();dz.classList.add('dragover')}));['dragleave','drop'].forEach(x=>dz.addEventListener(x,e=>{e.preventDefault();dz.classList.remove('dragover')}));dz.addEventListener('drop',e=>uploadFiles(e.dataTransfer.files))}
-async function uploadFiles(files){for(const file of [...files].filter(f=>f.type.startsWith('image/'))){saveStatus('Caricamento…');const ext=(file.name.split('.').pop()||'jpg').toLowerCase();const path=`${uid()}/${state.moodboard.project_id}/${crypto.randomUUID()}.${ext}`;const {error}=await supabaseClient.storage.from('moodboard-images').upload(path,file,{upsert:false,contentType:file.type});if(error){toast(error.message);continue}const {data:item,error:ie}=await supabaseClient.from('moodboard_items').insert({moodboard_id:state.moodboard.id,owner_id:uid(),storage_path:path,file_name:file.name,weight:3,category:'Riferimento'}).select().single();if(ie){toast(ie.message);continue}await ensureItemUrl(item);state.items.push(item)}if(state.items.length) await generateLayout(state.moodboard.layout_type); else {renderImageList();renderBoard()}saveStatus('Salvato')}
+async function uploadFiles(files){
+  for(const file of [...files].filter(f=>f.type.startsWith('image/'))){
+    saveStatus('Caricamento…');const ext=(file.name.split('.').pop()||'jpg').toLowerCase();const path=`${uid()}/${state.moodboard.project_id}/${crypto.randomUUID()}.${ext}`;
+    const {error}=await supabaseClient.storage.from('moodboard-images').upload(path,file,{upsert:false,contentType:file.type});if(error){toast(error.message);continue}
+    const {data:item,error:ie}=await supabaseClient.from('moodboard_items').insert({moodboard_id:state.moodboard.id,owner_id:uid(),storage_path:path,file_name:file.name,weight:3,category:'Riferimento'}).select().single();if(ie){toast(ie.message);continue}
+    await ensureItemUrl(item);state.items.push(item)
+  }
+  if(state.items.length){await generateLayout(state.moodboard.layout_type);await extractPalette(true)}else{renderImageList();renderBoard()}
+  saveStatus('Salvato')
+}
 async function ensureItemUrl(it){if(it._url)return it._url;it._url=await signedUrl(it.storage_path);return it._url}
 async function signedUrl(path){if(!path)return '';if(state.urls.has(path))return state.urls.get(path);const {data,error}=await supabaseClient.storage.from('moodboard-images').createSignedUrl(path,3600);if(error)return '';state.urls.set(path,data.signedUrl);return data.signedUrl}
 
-function renderBoard(){const b=$('#board');const title=$('.board-title',b);$$('.board-item',b).forEach(n=>n.remove());b.style.background=state.moodboard.background_color||'#fff';for(const [idx,it] of state.items.entries()){const el=document.createElement('div');el.className='board-item'+(state.selectedItem===it.id?' selected':'');el.dataset.id=it.id;el.style.left=`${it.x??5}%`;el.style.top=`${it.y??5}%`;el.style.width=`${it.w??25}%`;el.style.height=`${it.h??25}%`;el.style.transform=`rotate(${it.rotation||0}deg)`;el.style.zIndex=it.z_index??idx;el.innerHTML=`<img src="${it._url||''}">`;b.insertBefore(el,title);el.addEventListener('click',e=>{e.stopPropagation();selectItem(it.id)});if(!state.teacherViewing)makeDraggable(el,it)}b.onclick=()=>{state.selectedItem=null;renderBoard();renderSelectedControls()}}
-function makeDraggable(el,it){let start=null;el.addEventListener('pointerdown',e=>{if(e.button!==0)return;el.setPointerCapture(e.pointerId);start={px:e.clientX,py:e.clientY,x:it.x||0,y:it.y||0};selectItem(it.id)});el.addEventListener('pointermove',e=>{if(!start)return;const r=$('#board').getBoundingClientRect();it.x=Math.max(-5,Math.min(95,(start.x+(e.clientX-start.px)/r.width*100)));it.y=Math.max(-5,Math.min(95,(start.y+(e.clientY-start.py)/r.height*100)));el.style.left=it.x+'%';el.style.top=it.y+'%'});el.addEventListener('pointerup',()=>{if(!start)return;start=null;scheduleItemSave(it)})}
-function selectItem(id){state.selectedItem=id;$$('.board-item').forEach(e=>e.classList.toggle('selected',e.dataset.id===id));renderSelectedControls()}
-function renderSelectedControls(){const host=$('#selectedControls');if(!host)return;const it=state.items.find(x=>x.id===state.selectedItem);if(!it){host.innerHTML='<p class="muted" style="font-size:12px">Seleziona un’immagine sulla tavola per modificarne dimensione e rotazione.</p>';return}host.innerHTML=`<div class="stack"><strong>Immagine selezionata</strong><label>Larghezza <input id="selW" type="range" min="8" max="80" value="${it.w||25}" ${state.teacherViewing?'disabled':''}></label><label>Altezza <input id="selH" type="range" min="8" max="80" value="${it.h||25}" ${state.teacherViewing?'disabled':''}></label><label>Rotazione <input id="selR" type="range" min="-15" max="15" value="${it.rotation||0}" ${state.teacherViewing?'disabled':''}></label>${state.teacherViewing?'':`<button class="danger" data-action="delete-item">Rimuovi immagine</button>`}</div>`;if(!state.teacherViewing){[['selW','w'],['selH','h'],['selR','rotation']].forEach(([id,k])=>$('#'+id).addEventListener('input',e=>{it[k]=+e.target.value;renderBoard();scheduleItemSave(it)}))}}
-async function updateItemField(id,field,value,regen){const it=state.items.find(x=>x.id===id);if(!it)return;it[field]=value;await supabaseClient.from('moodboard_items').update({[field]:value}).eq('id',id);if(regen)generateLayout(state.moodboard.layout_type);else renderBoard();renderImageList()}
-async function deleteSelectedItem(){const it=state.items.find(x=>x.id===state.selectedItem);if(!it)return;if(!confirm('Rimuovere questa immagine dalla moodboard?'))return;await supabaseClient.from('moodboard_items').delete().eq('id',it.id);await supabaseClient.storage.from('moodboard-images').remove([it.storage_path]);state.items=state.items.filter(x=>x.id!==it.id);state.selectedItem=null;renderImageList();renderBoard();renderSelectedControls()}
+function renderBoard(){
+  const b=$('#board');const title=$('.board-title',b);$$('.board-item',b).forEach(n=>n.remove());b.style.background=state.moodboard.background_color||'#fff';
+  for(const [idx,it] of state.items.entries()){
+    const el=document.createElement('div');el.className='board-item'+(state.selectedItem===it.id?' selected':'');el.dataset.id=it.id;applyItemStyle(el,it,idx);el.innerHTML=`<img src="${it._url||''}">`;b.insertBefore(el,title);
+    el.addEventListener('click',e=>{e.stopPropagation();selectItem(it.id)});if(!state.teacherViewing)makeDraggable(el,it)
+  }
+  applyTitleStyle();b.onclick=()=>{state.selectedItem=null;$$('.board-item',b).forEach(e=>e.classList.remove('selected'));renderSelectedControls()}
+}
+function applyItemStyle(el,it,idx=0){el.style.left=`${it.x??5}%`;el.style.top=`${it.y??5}%`;el.style.width=`${it.w??25}%`;el.style.height=`${it.h??25}%`;el.style.transform=`rotate(${it.rotation||0}deg)`;el.style.zIndex=it.z_index??idx}
+function refreshBoardPositions(){for(const it of state.items){const el=$(`.board-item[data-id="${it.id}"]`);if(el)applyItemStyle(el,it)}}
 
-async function generateLayout(type){if(state.teacherViewing)return;state.moodboard.layout_type=type;const items=[...state.items].sort((a,b)=>b.weight-a.weight);if(!items.length)return;const placed=type==='griglia'?layoutGrid(items):type==='collage'?layoutCollage(items):type==='architettura'?layoutArchitecture(items):layoutEditorial(items);placed.forEach((p,i)=>Object.assign(p.item,p.box,{z_index:i+1}));renderEditor();saveStatus('Salvataggio…');await Promise.all(placed.map(p=>supabaseClient.from('moodboard_items').update({...p.box,z_index:p.item.z_index}).eq('id',p.item.id)));await updateMoodboard({layout_type:type});saveStatus('Salvato')}
-function areaScale(w){return 0.65+Math.pow(w/5,1.5)*1.1}
-function layoutGrid(items){const n=items.length,cols=Math.ceil(Math.sqrt(n*1.4)),rows=Math.ceil(n/cols),gap=1.8,cw=(100-gap*(cols+1))/cols,ch=(100-gap*(rows+1))/rows;return items.map((item,i)=>({item,box:{x:gap+(i%cols)*(cw+gap),y:gap+Math.floor(i/cols)*(ch+gap),w:cw,h:ch,rotation:0}}))}
-function layoutEditorial(items){const out=[];let y=4;items.forEach((item,i)=>{if(i===0){out.push({item,box:{x:4,y:4,w:56,h:61,rotation:0}});return}const k=i-1,col=k%2,row=Math.floor(k/2),w=17+item.weight*2.4,h=15+item.weight*1.8;out.push({item,box:{x:64+col*17,y:5+row*20,w:Math.min(w,31),h:Math.min(h,26),rotation:0}})});return normalizeBoxes(out)}
-function layoutArchitecture(items){const out=[];let slots=[{x:3,y:3,w:58,h:44},{x:63,y:3,w:34,h:25},{x:63,y:30,w:34,h:28},{x:3,y:49,w:28,h:48},{x:33,y:49,w:28,h:48},{x:63,y:61,w:34,h:36}];items.forEach((item,i)=>{const s=slots[i%slots.length],cycle=Math.floor(i/slots.length);out.push({item,box:{x:s.x+(cycle%3)*1.2,y:s.y+(cycle%2)*1.2,w:s.w/(1+cycle*.25),h:s.h/(1+cycle*.25),rotation:0}})});return out}
-function layoutCollage(items){const centers=[[8,8],[52,6],[18,47],[57,48],[35,25],[5,68],[70,70],[42,64],[72,28]];return items.map((item,i)=>{const [x,y]=centers[i%centers.length],s=areaScale(item.weight),w=Math.min(42,18*s),h=Math.min(38,15*s);return{item,box:{x:Math.min(95-w,x+(i%3)*2),y:Math.min(95-h,y+(i%2)*2),w,h,rotation:(i%2?-1:1)*(2+(i%4)*1.4)}}})}
-function normalizeBoxes(arr){return arr.map(p=>{p.box.x=Math.max(1,Math.min(98-p.box.w,p.box.x));p.box.y=Math.max(1,Math.min(98-p.box.h,p.box.y));return p})}
-function scheduleItemSave(it){saveStatus('Salvataggio…');clearTimeout(state.saveTimer);state.saveTimer=setTimeout(async()=>{await supabaseClient.from('moodboard_items').update({x:it.x,y:it.y,w:it.w,h:it.h,rotation:it.rotation,z_index:it.z_index}).eq('id',it.id);saveStatus('Salvato')},650)}
-function scheduleMoodboardSave(obj){saveStatus('Salvataggio…');clearTimeout(state.saveTimer);state.saveTimer=setTimeout(()=>updateMoodboard(obj),600)}
+function makeDraggable(el,it){
+  let start=null;let changed=new Set();
+  el.addEventListener('pointerdown',e=>{if(e.button!==0)return;e.stopPropagation();el.setPointerCapture(e.pointerId);start={px:e.clientX,py:e.clientY,x:+it.x||0,y:+it.y||0};changed=new Set([it.id]);el.classList.add('dragging');selectItem(it.id)});
+  el.addEventListener('pointermove',e=>{if(!start)return;const r=$('#board').getBoundingClientRect();it.x=clamp(start.x+(e.clientX-start.px)/r.width*100,0,100-(+it.w||25));it.y=clamp(start.y+(e.clientY-start.py)/r.height*100,0,100-(+it.h||25));if(state.moodboard.auto_reflow!==false){for(const id of reflowAround(it))changed.add(id)}refreshBoardPositions()});
+  el.addEventListener('pointerup',()=>{if(!start)return;start=null;el.classList.remove('dragging');queueItemsSave([...changed])});
+}
+function selectItem(id){state.selectedItem=id;$$('.board-item').forEach(e=>e.classList.toggle('selected',e.dataset.id===id));renderSelectedControls()}
+function renderSelectedControls(){
+  const host=$('#selectedControls');if(!host)return;const it=state.items.find(x=>x.id===state.selectedItem);
+  if(!it){host.innerHTML='<p class="muted" style="font-size:12px">Seleziona un’immagine sulla tavola per modificarne dimensione e rotazione.</p>';return}
+  host.innerHTML=`<div class="panel-separator"></div><div class="stack"><strong>Immagine selezionata</strong><label>Larghezza <span class="value-badge">${Math.round(it.w||25)}%</span><input id="selW" type="range" min="8" max="80" value="${it.w||25}" ${state.teacherViewing?'disabled':''}></label><label>Altezza <span class="value-badge">${Math.round(it.h||25)}%</span><input id="selH" type="range" min="8" max="80" value="${it.h||25}" ${state.teacherViewing?'disabled':''}></label><label>Rotazione <span class="value-badge">${Math.round(it.rotation||0)}°</span><input id="selR" type="range" min="-15" max="15" value="${it.rotation||0}" ${state.teacherViewing?'disabled':''}></label>${state.teacherViewing?'':`<button class="danger" data-action="delete-item">Rimuovi immagine</button>`}</div>`;
+  if(!state.teacherViewing){
+    [['selW','w'],['selH','h'],['selR','rotation']].forEach(([id,k])=>$('#'+id).addEventListener('input',e=>{it[k]=+e.target.value;let changed=new Set([it.id]);if(k!=='rotation'&&state.moodboard.auto_reflow!==false)changed=reflowAround(it);renderBoard();const badge=e.target.closest('label')?.querySelector('.value-badge');if(badge)badge.textContent=k==='rotation'?`${Math.round(it[k])}°`:`${Math.round(it[k])}%`;queueItemsSave([...changed])}))
+  }
+}
+async function updateItemField(id,field,value,regen){const it=state.items.find(x=>x.id===id);if(!it)return;it[field]=value;await supabaseClient.from('moodboard_items').update({[field]:value}).eq('id',id);if(regen)await generateLayout(state.moodboard.layout_type);else{renderBoard();renderImageList()}}
+async function deleteSelectedItem(){const it=state.items.find(x=>x.id===state.selectedItem);if(!it)return;if(!confirm('Rimuovere questa immagine dalla moodboard?'))return;await supabaseClient.from('moodboard_items').delete().eq('id',it.id);await supabaseClient.storage.from('moodboard-images').remove([it.storage_path]);state.items=state.items.filter(x=>x.id!==it.id);state.selectedItem=null;renderImageList();renderBoard();renderSelectedControls();if(state.items.length)extractPalette(true);else{state.moodboard.palette=[];await updateMoodboard({palette:[]});renderPalette()}}
+
+async function generateLayout(type){
+  if(state.teacherViewing)return;state.moodboard.layout_type=type;const items=[...state.items];if(!items.length)return;
+  const placed=type==='griglia'?layoutGrid(items):type==='collage'?layoutCollage(items):type==='architettura'?layoutArchitecture(items):layoutEditorial(items);
+  placed.forEach((p,i)=>Object.assign(p.item,p.box,{z_index:i+1}));renderEditor();saveStatus('Salvataggio…');
+  await Promise.all(placed.map(p=>supabaseClient.from('moodboard_items').update({...p.box,z_index:p.item.z_index}).eq('id',p.item.id)));await updateMoodboard({layout_type:type});saveStatus('Salvato')
+}
+function categoryGroup(item){return CATEGORY_GROUP[item.category]||'altro'}
+function orderedItems(items){return [...items].sort((a,b)=>CATEGORY_ORDER.indexOf(a.category)-CATEGORY_ORDER.indexOf(b.category)||b.weight-a.weight)}
+function layoutGrid(items){
+  items=orderedItems(items);const n=items.length,cols=Math.ceil(Math.sqrt(n*1.4)),rows=Math.ceil(n/cols),gap=1.8,cw=(100-gap*(cols+1))/cols,ch=(100-gap*(rows+1))/rows;
+  return items.map((item,i)=>({item,box:{x:gap+(i%cols)*(cw+gap),y:gap+Math.floor(i/cols)*(ch+gap),w:cw,h:ch,rotation:0}}))
+}
+function layoutEditorial(items){return layoutCategoryZones(items,{struttura:{x:3,y:3,w:58,h:61},materia:{x:64,y:3,w:33,h:48},atmosfera:{x:3,y:68,w:58,h:29},altro:{x:64,y:54,w:33,h:43}},false)}
+function layoutArchitecture(items){return layoutCategoryZones(items,{struttura:{x:3,y:3,w:59,h:55},materia:{x:64,y:3,w:33,h:55},atmosfera:{x:3,y:61,w:59,h:36},altro:{x:64,y:61,w:33,h:36}},false)}
+function layoutCollage(items){
+  const out=layoutCategoryZones(items,{struttura:{x:3,y:3,w:57,h:56},materia:{x:56,y:5,w:41,h:44},atmosfera:{x:4,y:56,w:68,h:41},altro:{x:68,y:49,w:29,h:48}},true);
+  return out.map((p,i)=>{p.box.rotation=(i%2?-1:1)*(1.2+(i%4)*.9);p.box.x=clamp(p.box.x+((i%3)-1)*1.1,1,98-p.box.w);p.box.y=clamp(p.box.y+((i%2)?1.2:-.6),1,98-p.box.h);return p})
+}
+function layoutCategoryZones(items,zones,collage=false){
+  const groups={struttura:[],materia:[],atmosfera:[],altro:[]};for(const it of items)groups[categoryGroup(it)].push(it);for(const g of Object.values(groups))g.sort((a,b)=>b.weight-a.weight);
+  const present=Object.entries(groups).filter(([,v])=>v.length);
+  if(present.length===1)return treemap(present[0][1],{x:3,y:3,w:94,h:94},collage);
+  if(present.length===2){const a=present[0],b=present[1];return [...treemap(a[1],{x:3,y:3,w:59,h:94},collage),...treemap(b[1],{x:65,y:3,w:32,h:94},collage)]}
+  const out=[];for(const [key,arr] of present){out.push(...treemap(arr,zones[key],collage))}return out
+}
+function treemap(items,zone,collage=false){
+  if(!items.length)return[];const sorted=[...items].sort((a,b)=>b.weight-a.weight);
+  function rec(arr,z,depth=0){
+    if(arr.length===1){const pad=collage?.8:1.2;return[{item:arr[0],box:{x:z.x+pad,y:z.y+pad,w:Math.max(.8,z.w-pad*2),h:Math.max(.8,z.h-pad*2),rotation:0}}]}
+    const vals=arr.map(x=>Math.pow(x.weight||3,1.45)),total=vals.reduce((a,b)=>a+b,0);let sum=0,cut=1;for(let i=0;i<vals.length-1;i++){sum+=vals[i];if(sum>=total/2){cut=i+1;break}}
+    const left=arr.slice(0,cut),right=arr.slice(cut),leftWeight=left.reduce((s,x)=>s+Math.pow(x.weight||3,1.45),0),ratio=leftWeight/total,gap=1.2;
+    if(z.w>=z.h){const w1=(z.w-gap)*ratio;return[...rec(left,{x:z.x,y:z.y,w:w1,h:z.h},depth+1),...rec(right,{x:z.x+w1+gap,y:z.y,w:z.w-w1-gap,h:z.h},depth+1)]}
+    const h1=(z.h-gap)*ratio;return[...rec(left,{x:z.x,y:z.y,w:z.w,h:h1},depth+1),...rec(right,{x:z.x,y:z.y+h1+gap,w:z.w,h:z.h-h1-gap},depth+1)]
+  }
+  return rec(sorted,zone)
+}
+
+function rectOverlap(a,b,margin=1.2){return !(a.x+a.w+margin<=b.x||b.x+b.w+margin<=a.x||a.y+a.h+margin<=b.y||b.y+b.h+margin<=a.y)}
+function moveAway(fixed,moving,margin=1.2){
+  const fx=fixed.x+fixed.w/2,fy=fixed.y+fixed.h/2,mx=moving.x+moving.w/2,my=moving.y+moving.h/2;
+  const pushR=fixed.x+fixed.w+margin-moving.x,pushL=moving.x+moving.w+margin-fixed.x,pushD=fixed.y+fixed.h+margin-moving.y,pushU=moving.y+moving.h+margin-fixed.y;
+  const opts=[];if(mx>=fx)opts.push(['x',pushR]);else opts.push(['x',-pushL]);if(my>=fy)opts.push(['y',pushD]);else opts.push(['y',-pushU]);opts.sort((a,b)=>Math.abs(a[1])-Math.abs(b[1]));
+  for(const [axis,d] of opts){const ox=moving.x,oy=moving.y;if(axis==='x')moving.x=clamp(moving.x+d,0,100-moving.w);else moving.y=clamp(moving.y+d,0,100-moving.h);if(!rectOverlap(fixed,moving,margin*.45))return ox!==moving.x||oy!==moving.y;moving.x=ox;moving.y=oy}
+  const dx=mx>=fx?2.5:-2.5,dy=my>=fy?2.5:-2.5;const ox=moving.x,oy=moving.y;moving.x=clamp(moving.x+dx,0,100-moving.w);moving.y=clamp(moving.y+dy,0,100-moving.h);return ox!==moving.x||oy!==moving.y
+}
+function reflowAround(active){
+  const changed=new Set([active.id]);const others=state.items.filter(x=>x.id!==active.id);
+  for(let pass=0;pass<7;pass++){
+    let moved=false;
+    for(const o of others){if(rectOverlap(active,o,1.1)&&moveAway(active,o,1.1)){changed.add(o.id);moved=true}}
+    for(let i=0;i<others.length;i++)for(let j=i+1;j<others.length;j++){const a=others[i],b=others[j];if(!rectOverlap(a,b,.8))continue;const fixed=(a.weight||3)>=(b.weight||3)?a:b,moving=fixed===a?b:a;if(moveAway(fixed,moving,.8)){changed.add(moving.id);moved=true}}
+    if(!moved)break
+  }
+  for(const id of changed)state.pendingItemIds.add(id);return changed
+}
+function clamp(v,min,max){return Math.max(min,Math.min(max,v))}
+
+function queueItemsSave(ids){for(const id of ids||[])state.pendingItemIds.add(id);saveStatus('Salvataggio…');clearTimeout(state.itemSaveTimer);state.itemSaveTimer=setTimeout(flushItemSaves,500)}
+async function flushItemSaves(){const ids=[...state.pendingItemIds];state.pendingItemIds.clear();const items=state.items.filter(x=>ids.includes(x.id));await Promise.all(items.map(it=>supabaseClient.from('moodboard_items').update({x:it.x,y:it.y,w:it.w,h:it.h,rotation:it.rotation,z_index:it.z_index}).eq('id',it.id)));saveStatus('Salvato')}
+function scheduleMoodboardSave(obj){saveStatus('Salvataggio…');Object.assign(state.moodboard,obj);Object.assign(state.pendingMoodboardPatch,obj);clearTimeout(state.moodboardSaveTimer);state.moodboardSaveTimer=setTimeout(async()=>{const patch={...state.pendingMoodboardPatch};state.pendingMoodboardPatch={};if(Object.keys(patch).length)await updateMoodboard(patch)},550)}
 async function updateMoodboard(obj){const {error}=await supabaseClient.from('moodboards').update(obj).eq('id',state.moodboard.id);if(error)return toast(error.message);Object.assign(state.moodboard,obj);saveStatus('Salvato')}
 async function toggleSubmit(){const next=state.moodboard.status==='submitted'?'draft':'submitted';await updateMoodboard({status:next,submitted_at:next==='submitted'?new Date().toISOString():null});toast(next==='submitted'?'Moodboard consegnata al docente':'Consegna riaperta');renderEditor()}
 
-function renderPalette(){const host=$('#palette');if(!host)return;const colors=['#202020','#d8d3c7','#a98968','#7a8175','#e6b45c'];host.innerHTML=colors.map(c=>`<span style="background:${c}"></span>`).join('')}
-async function exportBoard(){
-  // Export senza dipendenze esterne: ricostruisce la tavola su canvas.
-  const board=$('#board'),r=board.getBoundingClientRect(),scale=2,cv=document.createElement('canvas');cv.width=Math.round(r.width*scale);cv.height=Math.round(r.height*scale);const ctx=cv.getContext('2d');ctx.scale(scale,scale);ctx.fillStyle=state.moodboard.background_color||'#fff';ctx.fillRect(0,0,r.width,r.height);
-  for(const it of [...state.items].sort((a,b)=>(a.z_index||0)-(b.z_index||0))){try{const img=await loadImage(it._url);const x=(it.x||0)/100*r.width,y=(it.y||0)/100*r.height,w=(it.w||25)/100*r.width,h=(it.h||25)/100*r.height;ctx.save();ctx.translate(x+w/2,y+h/2);ctx.rotate((it.rotation||0)*Math.PI/180);drawCover(ctx,img,-w/2,-h/2,w,h);ctx.restore()}catch{}}
-  ctx.fillStyle='#111';ctx.font=`900 ${Math.max(20,r.width*.035)}px Arial`;ctx.fillText(state.moodboard.title, r.width*.04, r.height*.93, r.width*.58);const a=document.createElement('a');a.download=(state.moodboard.title||'moodboard').replace(/[^a-z0-9_-]+/gi,'_')+'.png';a.href=cv.toDataURL('image/png');a.click();
+function renderPalette(){
+  const host=$('#palette');if(!host)return;let colors=state.moodboard.palette||[];if(typeof colors==='string'){try{colors=JSON.parse(colors)}catch{colors=[]}}
+  if(!Array.isArray(colors)||!colors.length){host.innerHTML='<div class="palette-empty">Nessuna palette estratta</div>';return}
+  host.innerHTML=colors.map(c=>`<button type="button" class="palette-swatch" style="background:${esc(c)}" title="${esc(c)} · usa come sfondo" data-action="palette-bg" data-color="${esc(c)}"><span>${esc(c)}</span></button>`).join('')
 }
+async function usePaletteColor(color){if(state.teacherViewing)return;state.moodboard.background_color=color;$('#bgColor').value=color;$('#board').style.background=color;await updateMoodboard({background_color:color})}
+async function extractPalette(silent=false){
+  if(!state.items.length){if(!silent)toast('Aggiungi prima almeno un’immagine');return}
+  saveStatus('Analisi colori…');const samples=[];
+  for(const it of state.items){
+    try{const img=await loadImage(it._url);const cv=document.createElement('canvas'),size=56;cv.width=size;cv.height=size;const cx=cv.getContext('2d',{willReadFrequently:true});drawCover(cx,img,0,0,size,size);const data=cx.getImageData(0,0,size,size).data;const target=220+(it.weight||3)*170,step=Math.max(1,Math.floor((size*size)/target));for(let px=0;px<size*size;px+=step){const i=px*4,r=data[i],g=data[i+1],b=data[i+2],a=data[i+3];if(a<220)continue;if(r>250&&g>250&&b>250)continue;if(r<5&&g<5&&b<5)continue;samples.push([r,g,b])}}
+    catch(err){console.warn('palette image skipped',err)}
+  }
+  if(samples.length<10){saveStatus('Salvato');if(!silent)toast('Non riesco a leggere i colori di queste immagini');return}
+  const colors=kMeansPalette(samples,5);state.moodboard.palette=colors;await updateMoodboard({palette:colors});renderPalette();if(!silent)toast('Palette estratta dalle immagini')
+}
+function kMeansPalette(points,k=5){
+  const stride=Math.max(1,Math.floor(points.length/9000));points=points.filter((_,i)=>i%stride===0);const avg=points.reduce((a,p)=>[a[0]+p[0],a[1]+p[1],a[2]+p[2]],[0,0,0]).map(v=>v/points.length);const centers=[avg];
+  while(centers.length<Math.min(k,points.length)){let best=points[0],bestD=-1;for(const p of points){const d=Math.min(...centers.map(c=>colorDist(p,c)));if(d>bestD){bestD=d;best=p}}centers.push([...best])}
+  let counts=[];for(let iter=0;iter<9;iter++){const sums=centers.map(()=>[0,0,0,0]);for(const p of points){let bi=0,bd=Infinity;centers.forEach((c,i)=>{const d=colorDist(p,c);if(d<bd){bd=d;bi=i}});sums[bi][0]+=p[0];sums[bi][1]+=p[1];sums[bi][2]+=p[2];sums[bi][3]++}counts=sums.map(s=>s[3]);centers.forEach((c,i)=>{if(sums[i][3])centers[i]=[sums[i][0]/sums[i][3],sums[i][1]/sums[i][3],sums[i][2]/sums[i][3]]})}
+  return centers.map((c,i)=>({c,n:counts[i]||0})).filter(x=>x.n).sort((a,b)=>b.n-a.n).map(x=>rgbHex(x.c)).filter((c,i,a)=>a.findIndex(x=>hexDist(x,c)<26)===i).slice(0,k)
+}
+function colorDist(a,b){return Math.hypot(a[0]-b[0],a[1]-b[1],a[2]-b[2])}
+function rgbHex(c){return'#'+c.map(v=>Math.round(clamp(v,0,255)).toString(16).padStart(2,'0')).join('')}
+function hexDist(a,b){const p=x=>[parseInt(x.slice(1,3),16),parseInt(x.slice(3,5),16),parseInt(x.slice(5,7),16)];return colorDist(p(a),p(b))}
+
+async function exportBoard(){
+  const board=$('#board'),r=board.getBoundingClientRect(),scale=2,cv=document.createElement('canvas');cv.width=Math.round(r.width*scale);cv.height=Math.round(r.height*scale);const ctx=cv.getContext('2d');ctx.scale(scale,scale);ctx.fillStyle=state.moodboard.background_color||'#fff';ctx.fillRect(0,0,r.width,r.height);
+  for(const it of [...state.items].sort((a,b)=>(a.z_index||0)-(b.z_index||0))){try{const img=await loadImage(it._url);const x=(+it.x||0)/100*r.width,y=(+it.y||0)/100*r.height,w=(+it.w||25)/100*r.width,h=(+it.h||25)/100*r.height;ctx.save();ctx.translate(x+w/2,y+h/2);ctx.rotate((+it.rotation||0)*Math.PI/180);drawCover(ctx,img,-w/2,-h/2,w,h);ctx.restore()}catch{}}
+  const m=state.moodboard,fontPx=Math.max(12,r.width*(+m.title_size||4)/100),tx=r.width*(+m.title_x||4)/100,ty=r.height*(+m.title_y||84)/100,tw=r.width*(+m.title_width||60)/100;ctx.fillStyle=m.title_color||'#111';ctx.font=`${m.title_weight||900} ${fontPx}px ${fontCss(m.title_font||'Arial')}`;ctx.textBaseline='top';ctx.textAlign=m.title_align||'left';const ax=m.title_align==='center'?tx+tw/2:m.title_align==='right'?tx+tw:tx;drawWrappedText(ctx,m.title||'',ax,ty,tw,fontPx*.95,m.title_align||'left');
+  const a=document.createElement('a');a.download=(state.moodboard.title||'moodboard').replace(/[^a-z0-9_-]+/gi,'_')+'.png';a.href=cv.toDataURL('image/png');a.click();
+}
+function drawWrappedText(ctx,text,x,y,maxWidth,lineHeight,align='left'){const words=String(text).split(/\s+/),lines=[];let line='';for(const w of words){const test=line?line+' '+w:w;if(ctx.measureText(test).width>maxWidth&&line){lines.push(line);line=w}else line=test}if(line)lines.push(line);for(let i=0;i<lines.length;i++)ctx.fillText(lines[i],x,y+i*lineHeight,maxWidth)}
 function loadImage(src){return new Promise((res,rej)=>{const i=new Image();i.crossOrigin='anonymous';i.onload=()=>res(i);i.onerror=rej;i.src=src})}
 function drawCover(ctx,img,x,y,w,h){const ir=img.width/img.height,br=w/h;let sx=0,sy=0,sw=img.width,sh=img.height;if(ir>br){sw=img.height*br;sx=(img.width-sw)/2}else{sh=img.width/br;sy=(img.height-sh)/2}ctx.drawImage(img,sx,sy,sw,sh,x,y,w,h)}
 
